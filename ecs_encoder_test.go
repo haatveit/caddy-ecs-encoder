@@ -28,8 +28,8 @@ func TestProvisionDefaults(t *testing.T) {
 	if e.EventModule != defaultEventModule {
 		t.Errorf("EventModule = %q, want %q", e.EventModule, defaultEventModule)
 	}
-	if e.MapObjectEncoder == nil {
-		t.Error("embedded MapObjectEncoder must be non-nil after Provision")
+	if e.nestEncoder == nil {
+		t.Error("embedded nestEncoder must be non-nil after Provision")
 	}
 }
 

@@ -40,13 +40,18 @@ func init() {
 // ECSEncoder is a Caddy log encoder (caddy.logging.encoders.ecs) that remaps
 // Caddy's structured log fields into a nested Elastic Common Schema document.
 //
-// It embeds a *zapcore.MapObjectEncoder so that context fields added via
-// zap's logger.With() — which is how Caddy attaches the access log's "request"
-// object — are captured into a map we own. EncodeEntry merges that accumulated
-// context with the call-site fields, remaps the result via toECS, and marshals
-// it as one JSON line.
+// It embeds a *nestEncoder so that context fields added via zap's
+// logger.With() — which is how Caddy attaches the access log's "request"
+// object — are captured into a map we own, with nesting preserved. EncodeEntry
+// merges that accumulated context with the call-site fields, remaps the result
+// via toECS, and marshals it as one JSON line.
+//
+// The cursor-based nestEncoder (rather than zapcore.MapObjectEncoder) is what
+// lets the module be wrapped by Caddy's "filter" encoder
+// (`format filter { wrap ecs }`) without collapsing nested request fields; see
+// nest_encoder.go for the details.
 type ECSEncoder struct {
-	*zapcore.MapObjectEncoder `json:"-"`
+	*nestEncoder `json:"-"`
 
 	// ECSVersion is written to ecs.version on every event. Default "8.11.0".
 	ECSVersion string `json:"ecs_version,omitempty"`
@@ -76,7 +81,7 @@ func (e *ECSEncoder) Provision(_ caddy.Context) error {
 		e.EventModule = defaultEventModule
 	}
 	// Backs the ObjectEncoder method set and accumulates any With() context.
-	e.MapObjectEncoder = zapcore.NewMapObjectEncoder()
+	e.nestEncoder = newNestEncoder()
 	return nil
 }
 
@@ -93,11 +98,10 @@ func (e ECSEncoder) ecsConfig() ecsConfig {
 // logger.With(), then replays the new context fields into the clone.
 func (e ECSEncoder) Clone() zapcore.Encoder {
 	clone := e
-	clone.MapObjectEncoder = zapcore.NewMapObjectEncoder()
-	if e.MapObjectEncoder != nil {
-		for k, v := range e.MapObjectEncoder.Fields {
-			clone.MapObjectEncoder.Fields[k] = v
-		}
+	if e.nestEncoder != nil {
+		clone.nestEncoder = e.nestEncoder.clone()
+	} else {
+		clone.nestEncoder = newNestEncoder()
 	}
 	return clone
 }
@@ -105,17 +109,17 @@ func (e ECSEncoder) Clone() zapcore.Encoder {
 // EncodeEntry merges the accumulated With() context with the call-site fields,
 // remaps the result to ECS, and serializes it as a single JSON line.
 func (e ECSEncoder) EncodeEntry(ent zapcore.Entry, fields []zapcore.Field) (*buffer.Buffer, error) {
-	merged := zapcore.NewMapObjectEncoder()
-	if e.MapObjectEncoder != nil {
-		for k, v := range e.MapObjectEncoder.Fields {
-			merged.Fields[k] = v
+	merged := newNestEncoder()
+	if e.nestEncoder != nil {
+		for k, v := range e.nestEncoder.root {
+			merged.root[k] = v
 		}
 	}
 	for i := range fields {
 		fields[i].AddTo(merged)
 	}
 
-	doc := toECS(ent, merged.Fields, e.ecsConfig())
+	doc := toECS(ent, merged.root, e.ecsConfig())
 
 	data, err := json.Marshal(doc)
 	if err != nil {

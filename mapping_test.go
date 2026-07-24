@@ -407,6 +407,86 @@ func TestContextFieldsFromWith(t *testing.T) {
 	}
 }
 
+// filterMimic reproduces the essential behavior of Caddy's FilterEncoder that
+// used to break nesting: it replays fields into a single wrapped encoder
+// instance, and for nested objects it reroutes the object marshaler back
+// through *itself* (via filterObjWrap) rather than the child encoder that
+// AddObject passes. This is exactly logObjectMarshalerWrapper in
+// modules/logging/filterencoder.go. Embedding the ObjectEncoder interface gives
+// us the leaf/array delegations for free; we only override AddObject.
+type filterMimic struct {
+	zapcore.ObjectEncoder
+}
+
+func (f filterMimic) AddObject(key string, m zapcore.ObjectMarshaler) error {
+	return f.ObjectEncoder.AddObject(key, filterObjWrap{enc: f, marsh: m})
+}
+
+type filterObjWrap struct {
+	enc   filterMimic
+	marsh zapcore.ObjectMarshaler
+}
+
+func (o filterObjWrap) MarshalLogObject(_ zapcore.ObjectEncoder) error {
+	return o.marsh.MarshalLogObject(o.enc)
+}
+
+// TestFilterWrapPreservesNesting guards against the regression where wrapping
+// the ECS encoder with Caddy's filter encoder (`format filter { wrap ecs }`)
+// flattened every request.* sub-field onto the root — scattering method/host/
+// uri into labels.* and headers into caddy.*. With the cursor-based
+// nestEncoder, nesting survives the filter's replay-through-one-instance model.
+func TestFilterWrapPreservesNesting(t *testing.T) {
+	base := new(ECSEncoder)
+	if err := base.Provision(caddy.Context{}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	// Caddy's filter clones the wrapped encoder per entry and replays all fields
+	// (including the With()-attached request) through it via the wrapper.
+	clone := base.Clone().(ECSEncoder)
+	mimic := filterMimic{ObjectEncoder: clone}
+
+	zap.Object("request", requestMarshaler{
+		remoteIP: "192.0.2.10", remotePort: "54321", proto: "HTTP/1.1",
+		method: "GET", host: "example.com", uri: "/search?q=cats",
+		headers: headerMarshaler{"User-Agent": {"curl/8"}},
+	}).AddTo(mimic)
+	zap.Int("status", 200).AddTo(mimic)
+	zap.Int("size", 5).AddTo(mimic)
+
+	// filter calls wrapped.EncodeEntry(ent, nil) — everything is already staged.
+	buf, err := clone.EncodeEntry(accessEntry(), nil)
+	if err != nil {
+		t.Fatalf("EncodeEntry: %v", err)
+	}
+	defer buf.Free()
+
+	var out map[string]interface{}
+	if err := json.Unmarshal(buf.Bytes(), &out); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	// Nested request fields must land in their ECS homes, not labels.*/caddy.*.
+	assertEq(t, out, "http.request.method", "GET")
+	assertEq(t, out, "url.domain", "example.com")
+	assertEq(t, out, "url.path", "/search")
+	assertEq(t, out, "source.ip", "192.0.2.10")
+	assertEq(t, out, "source.port", float64(54321))
+	assertEq(t, out, "user_agent.original", "curl/8")
+	assertEq(t, out, "http.request.headers.User-Agent", []interface{}{"curl/8"})
+	assertEq(t, out, "http.response.status_code", float64(200))
+	assertEq(t, out, "http.response.body.bytes", float64(5))
+
+	// None of the request fields should have leaked into labels.
+	if v := get(t, out, "labels.method"); v != nil {
+		t.Errorf("labels.method should not exist; filter-wrap flattened nesting: %#v", v)
+	}
+	if v := get(t, out, "labels.host"); v != nil {
+		t.Errorf("labels.host should not exist; filter-wrap flattened nesting: %#v", v)
+	}
+}
+
 func TestTLSVersionMapping(t *testing.T) {
 	cases := map[uint16][2]string{
 		0x0300: {"3.0", "ssl"},

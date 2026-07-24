@@ -60,6 +60,34 @@ Equivalent JSON config:
 { "encoder": { "format": "ecs", "ecs_version": "8.11.0" } }
 ```
 
+## Redacting or filtering fields
+
+`ecs` composes with Caddy's built-in
+[`filter`](https://caddyserver.com/docs/caddyfile/directives/log#filter) encoder,
+so you can redact/hash/delete fields **before** they're remapped to ECS. Put
+`filter` on the outside and `wrap ecs` on the inside. `filter` operates on
+Caddy's native field paths (e.g. `request>headers>Api-Key`), then hands the
+result to `ecs` for ECS remapping:
+
+```caddyfile
+example.com {
+	log {
+		output file /var/log/caddy/access.log
+		format filter {
+			request>headers>Api-Key     replace REDACTED
+			request>headers>Api-Nonce   hash
+			request>headers>Cookie      delete
+			wrap ecs
+		}
+	}
+}
+```
+
+The redactions land in the correct nested location
+(`http.request.headers.Api-Key`), and everything else is remapped as usual.
+(Caddy already redacts `Authorization`, `Cookie`, `Set-Cookie`, and
+`Proxy-Authorization` on the request by default.)
+
 ## Field mapping
 
 Envelope and constants:
